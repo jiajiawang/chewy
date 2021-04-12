@@ -63,7 +63,7 @@ module Chewy
           if join
             join["parent"]
           else
-            parents[object] if parents #FIXME
+            parents[object] if parents.present? #FIXME
           end
         end
 
@@ -84,7 +84,7 @@ module Chewy
           end
         end
 
-        def indexed
+        def indexed #FIXME: rename
           @indexed ||= @index.index_by(&:id)
         end
 
@@ -93,21 +93,43 @@ module Chewy
           @join_field ||= @type.mappings_hash[@type.type_name.to_sym][:properties].find{|name, options| options[:type] == :join}&.first
         end
 
+        def parent_changed?(data, old_parent)
+          return false unless old_parent
+          return false unless join_field
+          return false unless @fields.include?(join_field)
+          return false unless data.key?(join_field.to_s)
+
+          # The join field value can be a hash, e.g.:
+          # {"name": "child", "parent": "123"} for a child
+          # {"name": "parent"} for a parent
+          # but it can also be a string: (e.g. "parent") for a parent:
+          # https://www.elastic.co/guide/en/elasticsearch/reference/current/parent-join.html#parent-join
+          new_join_field_value = data[join_field.to_s]
+          if new_join_field_value.is_a? Hash
+            # If we have a hash in the join field,
+            # we're taing the `parent` field that helds the parent id.
+            new_parent_id = new_join_field_value["parent"]
+            new_parent_id != old_parent[:parent_id]
+          else
+            # If there is a non-hash value (String or nil), it means that the join field is changed
+            # and the current object is no longer a child.
+            true
+          end
+        end
+
         def index_entry(object)
           entry = {}
           entry[:_id] = index_object_ids[object] if index_object_ids[object]
 
+          data = @type.compose(object, crutches)
           if parents.present?
             parent = entry[:_id].present? && parents[entry[:_id].to_s]
-            new_join_field_value = @type.compose(object, crutches)[join_field.to_s]
-            new_parent_id = new_join_field_value["parent"] if new_join_field_value.is_a? Hash
           end
 
           entry[:_routing] = routing(object) if  routing(object) && join_field
-          e = if parent && new_parent_id != parent.dig(:parent_id)
-            entry[:data] = @type.compose(object, crutches)
-            routing = existing_routing(object)
-            delete = {delete: entry.except(:data).merge(parent: parent[:parent_id], _routing: routing)}
+          if parent_changed?(data, parent)
+            entry[:data] = data
+            delete = delete_entry(object).first
             index = {index: entry}
             [delete, index]
           elsif @fields.present?
@@ -115,11 +137,9 @@ module Chewy
             entry[:data] = {doc: @type.compose(object, crutches, fields: @fields)}
             [{update: entry}]
           else
-            entry[:data] = @type.compose(object, crutches)
+            entry[:data] = data
             [{index: entry}]
           end
-
-            e
         end
 
         def delete_entry(object)
@@ -129,6 +149,7 @@ module Chewy
 
           return [] if entry[:_id].blank?
 
+          # load parents
           entry[:_routing] = existing_routing(object) if join_field
           if parents
             parent = entry[:_id].present? && parents[entry[:_id].to_s]

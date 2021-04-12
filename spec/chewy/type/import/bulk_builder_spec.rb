@@ -267,11 +267,13 @@ describe Chewy::Type::Import::BulkBuilder do
       end
 
       context 'when switching parents' do
-        let(:switching_parent_comment) { comments[0].tap { |c| c.update!(commented_id: 31) } }
-        let(:removing_parent_comment) { comments[1].tap { |c| c.update!(commented_id: nil, comment_type: nil) } }
-        let(:fields) { %w[commented_id] }
+        let(:switching_parent_comment) { comments[0].tap { |c| c.update!(commented_id: 31) } } # id: 3
+        let(:removing_parent_comment) { comments[1].tap { |c| c.update!(commented_id: nil, comment_type: nil) } } # id: 4
+        let(:converting_to_parent_comment) { comments[3].tap { |c| c.update!(commented_id: nil, comment_type: :question) } } # id: 12
+        let(:converting_to_child_comment) { comments[6].tap { |c| c.update!(commented_id: 1, comment_type: :answer) } } # id: 21
+        let(:fields) { %w[commented_id comment_type] }
 
-        let(:index) { [switching_parent_comment, removing_parent_comment] }
+        let(:index) { [switching_parent_comment, removing_parent_comment, converting_to_parent_comment, converting_to_child_comment] }
 
         before do
           existing_comments.each { |c| raw_index_comment(c) }
@@ -284,6 +286,10 @@ describe Chewy::Type::Import::BulkBuilder do
             {index: {_id: 3, _routing: '31', data: {'content' => 'There!', 'comment_type' => {'name' => 'answer', 'parent' => 31}}}},
             {delete: {_id: 4, _routing: '1', parent: 2}},
             {index: {_id: 4, _routing: '4', data: {'content' => 'Yes, he is here.', 'comment_type' => nil}}},
+            {delete: {_id: 12, _routing: '11', parent: 11}},
+            {index: {_id: 12, _routing: '12', data: {'content' => 'I don\'t know.', 'comment_type' => 'question'}}},
+            {delete: {_id: 21, _routing: '21'}},
+            {index: {_id: 21, _routing: '1', data: {'content' => 'How are you?', 'comment_type' => {'name' => 'answer', 'parent' => 1}}}}
           ])
         end
       end
