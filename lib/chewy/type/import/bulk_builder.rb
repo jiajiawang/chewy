@@ -25,6 +25,7 @@ module Chewy
         # @see https://github.com/elastic/elasticsearch-ruby/blob/master/elasticsearch-api/lib/elasticsearch/api/actions/bulk.rb
         # @return [Array<Hash>] bulk body
         def bulk_body
+          populate_cache
           @bulk_body ||= @index.flat_map(&method(:index_entry)).concat(
             @delete.flat_map(&method(:delete_entry))
           )
@@ -46,46 +47,78 @@ module Chewy
 
         def parents
           return unless join_field
-
-          @parents ||= begin
-            ids = @index.map do |object|
-              object.respond_to?(:id) ? object.id : object
-            end
-            ids.concat(@delete.map do |object|
-              object.respond_to?(:id) ? object.id : object
-            end)
-            @type.filter(ids: {values: ids}).order('_doc').pluck(:_id, :_routing, join_field).map{|id, routing, join| [id, {routing: routing, parent_id: join['parent']}]}.to_h
-          end
+          @cache
         end
 
-        def find_parent(object)
+        def ids_for_parents
+          ids = @index.map do |object|
+            object.respond_to?(:id) ? object.id : object
+          end
+          ids.concat(@delete.map do |object|
+            object.respond_to?(:id) ? object.id : object
+          end)
+          ids.compact
+        end
+
+        def find_parent_id(object)
           join = @type.compose(object, crutches)[join_field.to_s]
           if join
             join["parent"]
-          else
-            parents[object] if parents.present? #FIXME
+          elsif parents.present? #FIXME ####XXX why do we even need this branch?
+            puts "\nno-join, #{object.id} <#{parents[object.id]}>"
+            parents[object.id]
           end
         end
 
-        def existing_routing(object)
-          #FIXME: UGLY AND SLOW!
-          @type.filter(ids: {values: [object.id]}).pluck(:_routing).first
+        #TODO merge with #find_parent_id
+        def parent_id_for(object)
+          join = @type.compose(object, crutches)[join_field.to_s]
+          join["parent"] if join
+        end
+
+        def ids_for_existing_routing
+          ids = @index.map do |object|
+            parent_id_for(object) if object.respond_to?(:id)
+          end
+          ids.concat(@delete.map do |object|
+            object.id if object.respond_to?(:id)
+          end)
+          ids = ids.compact
+        end
+
+        def load_cache
+          return {} unless join_field
+
+          ids = ids_for_parents | ids_for_existing_routing
+          @type.filter(ids: {values: ids}).order('_doc').pluck(:_id, :_routing, join_field).map{|id, routing, join| [id, {routing: routing, parent_id: join['parent']}]}.to_h
+        end
+
+        def populate_cache
+          @cache ||= load_cache
+        end
+
+        def existing_routing(id)
+          # We cache current objects to avoid needless calls. If we need their ancestors, we call ES.
+          puts "\n===cache: #{@cache}, id: #{id}\n"
+          if @cache[id.to_s]
+            @cache[id.to_s][:routing]
+          else
+            #FIXME this branch is not executed in specs, I'm not sure if it's needed
+            # We load objects and their parents to the cache, so maybe it's enough
+            puts "\n\n=============== cache miss #{id} \n\n\n"
+            @type.filter(ids: {values: [id]}).pluck(:_routing).first
+          end
         end
 
         def routing(object)
-          return unless object.respond_to?(:id) #non-model objects
-          parent = find_parent(object)
+          return unless object.respond_to?(:id) #filter out non-model objects, early return on object==nil
+          parent_id = find_parent_id(object)
 
-          if parent
-            #FIXME: UGLY AND SLOW!
-            routing(indexed[parent]) || @type.filter(ids: {values: [parent]}).pluck(:_routing).first
+          if parent_id
+            routing(index_objects_by_id[parent_id.to_s]) || existing_routing(parent_id)
           else
             object.id.to_s
           end
-        end
-
-        def indexed #FIXME: rename
-          @indexed ||= @index.index_by(&:id)
         end
 
         #TODO move to a better place
@@ -126,7 +159,7 @@ module Chewy
             parent = entry[:_id].present? && parents[entry[:_id].to_s]
           end
 
-          entry[:_routing] = routing(object) if  routing(object) && join_field
+          entry[:_routing] = routing(object) if join_field
           if parent_changed?(data, parent)
             entry[:data] = data
             delete = delete_entry(object).first
@@ -150,7 +183,7 @@ module Chewy
           return [] if entry[:_id].blank?
 
           # load parents
-          entry[:_routing] = existing_routing(object) if join_field
+          entry[:_routing] = existing_routing(object.id) if join_field
           if parents
             parent = entry[:_id].present? && parents[entry[:_id].to_s]
             if parent && parent[:parent_id]

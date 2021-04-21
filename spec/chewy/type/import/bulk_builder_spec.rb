@@ -185,7 +185,7 @@ describe Chewy::Type::Import::BulkBuilder do
           define_type Comment do
             field :content
             #TODO extract `join` type handling to the production chewy code to make it reusable
-            field :comment_type, type: :join, relations: {question: [:answer, :comment], answer: :vote}, value: -> { commented_id.present? ? {name: comment_type, parent: commented_id} : comment_type }
+            field :comment_type, type: :join, relations: {question: [:answer, :comment], answer: :vote, vote: :subvote}, value: -> { commented_id.present? ? {name: comment_type, parent: commented_id} : comment_type }
           end
         end
       end
@@ -252,20 +252,6 @@ describe Chewy::Type::Import::BulkBuilder do
         end
       end
 
-      context 'when indexing with grandparents' do
-        let(:index) { [comments[1]] }
-
-        before do
-          existing_comments.each { |c| raw_index_comment(c) }
-        end
-
-        specify do
-          expect(subject.bulk_body).to eq([
-            {index: {_id: 4, _routing: '1', data: {'content' => 'Yes, he is here.', 'comment_type' => {'name' => 'vote', 'parent' => 2}}}},
-          ])
-        end
-      end
-
       context 'when switching parents' do
         let(:switching_parent_comment) { comments[0].tap { |c| c.update!(commented_id: 31) } } # id: 3
         let(:removing_parent_comment) { comments[1].tap { |c| c.update!(commented_id: nil, comment_type: nil) } } # id: 4
@@ -290,6 +276,55 @@ describe Chewy::Type::Import::BulkBuilder do
             {index: {_id: 12, _routing: '12', data: {'content' => 'I don\'t know.', 'comment_type' => 'question'}}},
             {delete: {_id: 21, _routing: '21'}},
             {index: {_id: 21, _routing: '1', data: {'content' => 'How are you?', 'comment_type' => {'name' => 'answer', 'parent' => 1}}}}
+          ])
+        end
+      end
+
+      context 'when indexing with grandparents' do
+        let(:comments) do
+          [
+            Comment.create!(id: 3, content: 'Yes, he is here.', comment_type: :vote, commented_id: 2),
+            Comment.create!(id: 4, content: 'What?', comment_type: :subvote, commented_id: 3)
+          ]
+        end
+        let(:index) { comments }
+
+        before do
+          existing_comments.each { |c| raw_index_comment(c) }
+        end
+
+        specify do
+          expect(subject.bulk_body).to eq([
+            {index: {_id: 3, _routing: '1', data: {'content' => 'Yes, he is here.', 'comment_type' => {'name' => 'vote', 'parent' => 2}}}},
+            {index: {_id: 4, _routing: '1', data: {'content' => 'What?', 'comment_type' => {'name' => 'subvote', 'parent' => 3}}}}
+          ])
+        end
+      end
+
+      context 'when switching grandparents' do
+        let(:comments) do
+          [
+            Comment.create!(id: 3, content: 'Yes, he is here.', comment_type: :vote, commented_id: 2),
+            Comment.create!(id: 4, content: 'What?', comment_type: :subvote, commented_id: 2),
+          ]
+        end
+        let(:switching_parent_comment) { existing_comments[1].tap { |c| c.update!(commented_id: 31) } } # id: 2
+        let(:fields) { %w[commented_id comment_type] }
+        let(:index) { [switching_parent_comment] }
+
+        before do
+          existing_comments.each { |c| raw_index_comment(c) }
+          comments.each { |c| raw_index_comment(c) }
+        end
+
+        xit 'reindexes children and grandchildren' do
+          expect(subject.bulk_body).to eq([
+            {delete: {_id: 2, _routing: '1', parent: 1}},
+            {index: {_id: 2, _routing: '31', data: {'content' => 'Here.', 'comment_type' => {'name' => 'answer', 'parent' => 31}}}},
+            {delete: {_id: 3, _routing: '1', parent: 2}},
+            {index: {_id: 3, _routing: '31', data: {'content' => 'Yes, he is here.', 'comment_type' => {'name' => 'vote', 'parent' => 2}}}},
+            {delete: {_id: 4, _routing: '1', parent: 3}},
+            {index: {_id: 4, _routing: '31', data: {'content' => 'What?', 'comment_type' => {'name' => 'subvote', 'parent' => 3}}}},
           ])
         end
       end
