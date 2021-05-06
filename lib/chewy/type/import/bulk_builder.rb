@@ -1,4 +1,4 @@
-          require 'pry'
+          require 'pry' #FIXME, remove it
 module Chewy
   class Type
     module Import
@@ -150,7 +150,9 @@ module Chewy
         end
 
         def find_join_field
-          properties = @type.mappings_hash[@type.type_name.to_sym][:properties]
+          type_settings = @type.mappings_hash[@type.type_name.to_sym]
+          return unless type_settings
+          properties = type_settings[:properties]
           join_fields = properties.find { |_, options| options[:type] == :join }
           return unless join_fields
 
