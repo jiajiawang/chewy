@@ -10,6 +10,8 @@ module Chewy
       # If fields are passed - it creates partial update entries except for
       # the cases when the type has parent and parent_id has been changed.
       class BulkBuilder
+        RoutingCacheMissError = Class.new(StandardError)
+
         # @param type [Chewy::Type] desired type
         # @param index [Array<Object>] objects to index
         # @param delete [Array<Object>] objects or ids to delete
@@ -45,121 +47,14 @@ module Chewy
           @crutches ||= Chewy::Type::Crutch::Crutches.new @type, @index
         end
 
-        def parents
-          return unless join_field
-          @cache
-        end
-
-        def ids_for_parents
-          ids = @index.map do |object|
-            object.respond_to?(:id) ? object.id : object
-          end
-          ids.concat(@delete.map do |object|
-            object.respond_to?(:id) ? object.id : object
-          end)
-          ids.compact
-        end
-
-        def find_parent_id(object)
-          join = @type.compose(object, crutches)[join_field.to_s]
-          if join
-            join["parent"]
-          elsif parents.present? #FIXME ####XXX why do we even need this branch?
-            puts "\nno-join, #{object.id} <#{parents[object.id]}>"
-            parents[object.id]
-          end
-        end
-
-        #TODO merge with #find_parent_id
-        def parent_id_for(object)
-          join = @type.compose(object, crutches)[join_field.to_s]
-          join["parent"] if join
-        end
-
-        def ids_for_existing_routing
-          ids = @index.map do |object|
-            parent_id_for(object) if object.respond_to?(:id)
-          end
-          ids.concat(@delete.map do |object|
-            object.id if object.respond_to?(:id)
-          end)
-          ids = ids.compact
-        end
-
-        def load_cache
-          return {} unless join_field
-
-          ids = ids_for_parents | ids_for_existing_routing
-          @type.filter(ids: {values: ids}).order('_doc').pluck(:_id, :_routing, join_field).map{|id, routing, join| [id, {routing: routing, parent_id: join['parent']}]}.to_h
-        end
-
-        def populate_cache
-          @cache ||= load_cache
-        end
-
-        def existing_routing(id)
-          # We cache current objects to avoid needless calls. If we need their ancestors, we call ES.
-          puts "\n===cache: #{@cache}, id: #{id}\n"
-          if @cache[id.to_s]
-            @cache[id.to_s][:routing]
-          else
-            #FIXME this branch is not executed in specs, I'm not sure if it's needed
-            # We load objects and their parents to the cache, so maybe it's enough
-            puts "\n\n=============== cache miss #{id} \n\n\n"
-            @type.filter(ids: {values: [id]}).pluck(:_routing).first
-          end
-        end
-
-        def routing(object)
-          return unless object.respond_to?(:id) #filter out non-model objects, early return on object==nil
-          parent_id = find_parent_id(object)
-
-          if parent_id
-            routing(index_objects_by_id[parent_id.to_s]) || existing_routing(parent_id)
-          else
-            object.id.to_s
-          end
-        end
-
-        #TODO move to a better place
-        def join_field
-          @join_field ||= @type.mappings_hash[@type.type_name.to_sym][:properties].find{|name, options| options[:type] == :join}&.first
-        end
-
-        def parent_changed?(data, old_parent)
-          return false unless old_parent
-          return false unless join_field
-          return false unless @fields.include?(join_field)
-          return false unless data.key?(join_field.to_s)
-
-          # The join field value can be a hash, e.g.:
-          # {"name": "child", "parent": "123"} for a child
-          # {"name": "parent"} for a parent
-          # but it can also be a string: (e.g. "parent") for a parent:
-          # https://www.elastic.co/guide/en/elasticsearch/reference/current/parent-join.html#parent-join
-          new_join_field_value = data[join_field.to_s]
-          if new_join_field_value.is_a? Hash
-            # If we have a hash in the join field,
-            # we're taing the `parent` field that helds the parent id.
-            new_parent_id = new_join_field_value["parent"]
-            new_parent_id != old_parent[:parent_id]
-          else
-            # If there is a non-hash value (String or nil), it means that the join field is changed
-            # and the current object is no longer a child.
-            true
-          end
-        end
-
         def index_entry(object)
           entry = {}
           entry[:_id] = index_object_ids[object] if index_object_ids[object]
 
-          data = @type.compose(object, crutches)
-          if parents.present?
-            parent = entry[:_id].present? && parents[entry[:_id].to_s]
-          end
+          data = data_for(object)
+          parent = parents[entry[:_id].to_s]
 
-          entry[:_routing] = routing(object) if join_field
+          entry[:_routing] = routing(object) if join_field?
           if parent_changed?(data, parent)
             entry[:data] = data
             delete = delete_entry(object).first
@@ -167,7 +62,7 @@ module Chewy
             [delete, index]
           elsif @fields.present?
             return [] unless entry[:_id]
-            entry[:data] = {doc: @type.compose(object, crutches, fields: @fields)}
+            entry[:data] = {doc: data_for(object, fields: @fields)}
             [{update: entry}]
           else
             entry[:data] = data
@@ -182,16 +77,116 @@ module Chewy
 
           return [] if entry[:_id].blank?
 
-          # load parents
-          entry[:_routing] = existing_routing(object.id) if join_field
-          if parents
-            parent = entry[:_id].present? && parents[entry[:_id].to_s]
-            if parent && parent[:parent_id]
-              entry[:parent] = parent[:parent_id]
-            end
-          end
+          parent = parents[entry[:_id].to_s]
+
+          entry[:_routing] = existing_routing(object.id) if join_field?
+          entry[:parent] = parent[:parent_id] if parent && parent[:parent_id]
 
           [{delete: entry}]
+        end
+
+        def populate_cache
+          @cache ||= load_cache
+        end
+
+        def load_cache
+          return {} unless join_field?
+
+          @type
+            .filter(ids: {values: ids_for_cache})
+            .order('_doc')
+            .pluck(:_id, :_routing, join_field)
+            .map do |id, routing, join|
+              [
+                id,
+                {routing: routing, parent_id: join['parent']}
+              ]
+            end.to_h
+        end
+
+        def existing_routing(id)
+          # All objects needed here should be cached in #load_cache,
+          # if not, we raise an error.
+          raise RoutingCacheMissError unless @cache[id.to_s]
+
+          @cache[id.to_s][:routing]
+        end
+
+        def ids_for_cache
+          ids = @index.flat_map do |object|
+            [find_parent_id(object), object.id] if object.respond_to?(:id)
+          end
+          ids.concat(@delete.map do |object|
+            object.id if object.respond_to?(:id)
+          end)
+          ids.uniq.compact
+        end
+
+        def routing(object)
+          # filter out non-model objects, early return on object==nil
+          return unless object.respond_to?(:id)
+
+          parent_id = find_parent_id(object)
+          if parent_id
+            routing(index_objects_by_id[parent_id.to_s]) || existing_routing(parent_id)
+          else
+            object.id.to_s
+          end
+        end
+
+        def parents
+          @cache
+        end
+
+        def find_parent_id(object)
+          join = data_for(object)[join_field]
+          join['parent'] if join
+        end
+
+        def join_field
+          return @join_field if defined?(@join_field)
+
+          @join_field = find_join_field
+        end
+
+        def find_join_field
+          properties = @type.mappings_hash[@type.type_name.to_sym][:properties]
+          join_fields = properties.find { |_, options| options[:type] == :join }
+          return unless join_fields
+
+          join_fields.first.to_s
+        end
+
+        def join_field?
+          join_field && !join_field.empty?
+        end
+
+        def data_for(object, fields: [])
+          @type.compose(object, crutches, fields: fields)
+        end
+
+        def parent_changed?(data, old_parent)
+          return false unless old_parent
+          return false unless join_field?
+          return false unless @fields.include?(join_field.to_sym)
+          return false unless data.key?(join_field)
+
+          # The join field value can be a hash, e.g.:
+          # {"name": "child", "parent": "123"} for a child
+          # {"name": "parent"} for a parent
+          # but it can also be a string: (e.g. "parent") for a parent:
+          # https://www.elastic.co/guide/en/elasticsearch/reference/current/parent-join.html#parent-join
+          new_join_field_value = data[join_field]
+          if new_join_field_value.is_a? Hash
+            # If we have a hash in the join field,
+            # we're taing the `parent` field that helds the parent id.
+            new_parent_id = new_join_field_value["parent"]
+            new_parent_id != old_parent[:parent_id]
+          else
+            # If there is a non-hash value (String or nil), it means that the join field is changed
+            # and the current object is no longer a child.
+            true
+          end
         end
 
         def entry_id(object)
